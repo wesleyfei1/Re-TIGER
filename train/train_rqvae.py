@@ -35,12 +35,16 @@ def parse_args():
     )
     parser.add_argument("--batch_size", type=int, default=1024)
     parser.add_argument("--epochs", type=int, default=20000)
-    parser.add_argument("--lr", type=float, default=0.4)
+    parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=11)
     parser.add_argument("--commit_cost", type=float, default=0.25)
     parser.add_argument("--latent_dim", type=int, default=32)
     parser.add_argument("--codebook_size", type=int, default=256)
     parser.add_argument("--num_codebooks", type=int, default=3)
+    parser.add_argument("--ae_pretrain_epochs", type=int, default=5)
+    parser.add_argument("--kmeans_iters", type=int, default=20)
+    parser.add_argument("--ema_decay", type=float, default=0.99)
+    parser.add_argument("--dead_code_threshold", type=int, default=10)
     parser.add_argument("--init_kmeans", action="store_true")
     parser.add_argument("--codebook_init_path", default="")
     parser.add_argument("--device", default="cuda")
@@ -136,6 +140,8 @@ def main():
         codebook_size=args.codebook_size,
         num_codebooks=args.num_codebooks,
         commit_cost=args.commit_cost,
+        ema_decay=args.ema_decay,
+        dead_code_threshold=args.dead_code_threshold,
     ).to(device)
 
     try:
@@ -157,6 +163,8 @@ def main():
         "num_codebooks": args.num_codebooks,
         "init_kmeans": args.init_kmeans,
         "codebook_init_path": args.codebook_init_path,
+        "ema_decay": args.ema_decay,
+        "dead_code_threshold": args.dead_code_threshold,
     }
     wandb.init(
         project=args.wandb_project,
@@ -164,22 +172,42 @@ def main():
         config=wandb_config,
     )
 
+    if args.ae_pretrain_epochs > 0:
+        ae_optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+        recon_loss_fn = nn.MSELoss()
+        for epoch in range(1, args.ae_pretrain_epochs + 1):
+            model.train()
+            total_recon = 0.0
+            for (batch,) in loader:
+                ae_optimizer.zero_grad()
+                z_e = model.encode(batch)
+                recon = model.decode(z_e)
+                recon_loss = recon_loss_fn(recon, batch)
+                recon_loss.backward()
+                ae_optimizer.step()
+                total_recon += recon_loss.item() * batch.size(0)
+            avg_recon = total_recon / len(dataset)
+            wandb.log({"ae_epoch": epoch, "ae_recon_loss": avg_recon})
+            if epoch % 1 == 0:
+                print(f"AE Epoch {epoch}: recon={avg_recon:.6f}")
+
     if codebook_payload and "codebooks" in codebook_payload:
         model.quantizer.set_codebooks(codebook_payload["codebooks"].to(device))
-    elif args.init_kmeans:
+    else:
+        first_batch = next(iter(loader))[0].to(device)
         with torch.no_grad():
-            z_e = model.encoder(x)
+            z_e = model.encoder(first_batch)
         codebooks = residual_kmeans_init(
             z_e,
             codebook_size=args.codebook_size,
             num_codebooks=args.num_codebooks,
-            iters=20,
+            iters=args.kmeans_iters,
             seed=args.seed,
-            batch_size=args.batch_size,
+            batch_size=min(args.batch_size, first_batch.size(0)),
         )
         model.quantizer.set_codebooks(codebooks)
 
-    optimizer = torch.optim.Adagrad(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     recon_loss_fn = nn.MSELoss()
 
     for epoch in range(1, args.epochs + 1):
@@ -200,14 +228,23 @@ def main():
         avg_loss = total_loss / len(dataset)
         avg_recon = total_recon / len(dataset)
         avg_q = total_q / len(dataset)
-        wandb.log(
-            {
-                "epoch": epoch,
-                "loss": avg_loss,
-                "recon_loss": avg_recon,
-                "quant_loss": avg_q,
-            }
-        )
+        with torch.no_grad():
+            sample_codes = model.encode_codes(x[: min(4096, x.shape[0])], batch_size=args.batch_size)
+        usage = []
+        for i in range(sample_codes.shape[1]):
+            unique = len(torch.unique(sample_codes[:, i]))
+            usage.append(unique / args.codebook_size)
+
+        log_payload = {
+            "epoch": epoch,
+            "loss": avg_loss,
+            "recon_loss": avg_recon,
+            "quant_loss": avg_q,
+            "codebook_usage_avg": float(sum(usage) / len(usage)),
+        }
+        for i, val in enumerate(usage):
+            log_payload[f"codebook_usage_{i}"] = val
+        wandb.log(log_payload)
         if epoch % 100 == 0:
             print(
                 f"Epoch {epoch}: loss={avg_loss:.6f}, recon={avg_recon:.6f}, quant={avg_q:.6f}"

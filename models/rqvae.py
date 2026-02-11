@@ -13,17 +13,31 @@ class ResidualQuantizer(nn.Module):
         codebook_size: int,
         num_codebooks: int,
         commit_cost: float = 0.25,
+        ema_decay: float = 0.99,
+        ema_eps: float = 1e-5,
+        dead_code_threshold: int = 10,
     ) -> None:
         super().__init__()
         self.dim = dim
         self.codebook_size = codebook_size
         self.num_codebooks = num_codebooks
         self.commit_cost = commit_cost
+        self.ema_decay = ema_decay
+        self.ema_eps = ema_eps
+        self.dead_code_threshold = dead_code_threshold
         self.codebooks = nn.Parameter(
             torch.randn(num_codebooks, codebook_size, dim) / math.sqrt(dim)
         )
+        self.register_buffer(
+            "ema_cluster_size", torch.zeros(num_codebooks, codebook_size)
+        )
+        self.register_buffer(
+            "ema_codebook", torch.zeros(num_codebooks, codebook_size, dim)
+        )
 
-    def _nearest_code(self, x: torch.Tensor, codebook: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _nearest_code(
+        self, x: torch.Tensor, codebook: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         x_flat = x.view(-1, self.dim)
         x_norm = (x_flat ** 2).sum(dim=1, keepdim=True)
         c_norm = (codebook ** 2).sum(dim=1).unsqueeze(0)
@@ -31,6 +45,34 @@ class ResidualQuantizer(nn.Module):
         indices = torch.argmin(distances, dim=1)
         quantized = codebook[indices].view_as(x)
         return quantized, indices.view(x.shape[0], -1)
+
+    def _ema_update(self, codebook_idx: int, x: torch.Tensor, indices: torch.Tensor) -> None:
+        flat_idx = indices.view(-1)
+        one_hot = F.one_hot(flat_idx, num_classes=self.codebook_size).float()
+        cluster_size = one_hot.sum(dim=0)
+        embed_sum = one_hot.t() @ x.view(-1, self.dim)
+
+        self.ema_cluster_size[codebook_idx] = (
+            self.ema_cluster_size[codebook_idx] * self.ema_decay
+            + (1 - self.ema_decay) * cluster_size
+        )
+        self.ema_codebook[codebook_idx] = (
+            self.ema_codebook[codebook_idx] * self.ema_decay
+            + (1 - self.ema_decay) * embed_sum
+        )
+        n = self.ema_cluster_size[codebook_idx] + self.ema_eps
+        self.codebooks.data[codebook_idx] = self.ema_codebook[codebook_idx] / n.unsqueeze(1)
+
+        if self.dead_code_threshold > 0:
+            dead = self.ema_cluster_size[codebook_idx] < self.dead_code_threshold
+            if dead.any():
+                rand_idx = torch.randint(
+                    0,
+                    x.view(-1, self.dim).size(0),
+                    (dead.sum().item(),),
+                    device=x.device,
+                )
+                self.codebooks.data[codebook_idx, dead] = x.view(-1, self.dim)[rand_idx]
 
     def forward(self, z_e: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         residual = z_e
@@ -43,6 +85,8 @@ class ResidualQuantizer(nn.Module):
             quantized_sum = quantized_sum + quantized
             residual = residual - quantized
             all_codes.append(indices.squeeze(1))
+            if self.training:
+                self._ema_update(i, residual.detach() + quantized.detach(), indices)
 
         codes = torch.stack(all_codes, dim=1)
         codebook_loss = F.mse_loss(quantized_sum.detach(), z_e)
@@ -69,6 +113,9 @@ class RQVAE(nn.Module):
         codebook_size: int = 256,
         num_codebooks: int = 3,
         commit_cost: float = 0.25,
+        ema_decay: float = 0.99,
+        ema_eps: float = 1e-5,
+        dead_code_threshold: int = 10,
     ) -> None:
         super().__init__()
         if hidden_dims is None:
@@ -80,6 +127,9 @@ class RQVAE(nn.Module):
             codebook_size=codebook_size,
             num_codebooks=num_codebooks,
             commit_cost=commit_cost,
+            ema_decay=ema_decay,
+            ema_eps=ema_eps,
+            dead_code_threshold=dead_code_threshold,
         )
 
     @staticmethod

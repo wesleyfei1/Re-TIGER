@@ -78,6 +78,7 @@ def beam_search_decode(
     src_pad: torch.Tensor,
     max_len: int,
     beam_size: int,
+    code_vocab: int,
     device: torch.device,
 ) -> List[List[int]]:
     beams: List[Tuple[List[int], float, bool]] = [([BOS_ID], 0.0, False)]
@@ -92,7 +93,12 @@ def beam_search_decode(
             tgt_pad = tgt.eq(PAD_ID)
             logits = model(src, tgt, src_key_padding_mask=src_pad, tgt_key_padding_mask=tgt_pad)
             log_probs = torch.log_softmax(logits[:, -1, :], dim=-1)
-            topk = torch.topk(log_probs, beam_size, dim=-1)
+            allowed = torch.full_like(log_probs, float("-inf"))
+            start = CODE_OFFSET
+            end = CODE_OFFSET + code_vocab
+            allowed[:, start:end] = log_probs[:, start:end]
+            allowed[:, EOS_ID] = log_probs[:, EOS_ID]
+            topk = torch.topk(allowed, beam_size, dim=-1)
             for k in range(topk.indices.size(1)):
                 token = topk.indices[0, k].item()
                 new_score = score + topk.values[0, k].item()
@@ -106,10 +112,15 @@ def beam_search_decode(
     return [tokens for tokens, _, _ in beams]
 
 
-def tokens_to_item_id(tokens: List[int], semantic_to_item: Dict[str, List[str]]) -> str | None:
+def tokens_to_semantic_id(tokens: List[int]) -> str:
     code_tokens = [t - CODE_OFFSET for t in tokens]
-    key = ",".join(str(t) for t in code_tokens)
-    items = semantic_to_item.get(key)
+    return ",".join(str(t) for t in code_tokens)
+
+
+def semantic_id_to_item_id(
+    semantic_id: str, semantic_to_item: Dict[str, List[str]]
+) -> str | None:
+    items = semantic_to_item.get(semantic_id)
     if not items:
         return None
     return items[0]
@@ -136,7 +147,15 @@ def predict_topk_items(
     src = src[-max_src_len:]
     src_tensor = torch.tensor([src], dtype=torch.long, device=device)
     src_pad = src_tensor.eq(PAD_ID)
-    beams = beam_search_decode(model, src_tensor, src_pad, max_tgt_len, beam_size, device)
+    beams = beam_search_decode(
+        model,
+        src_tensor,
+        src_pad,
+        max_tgt_len,
+        beam_size,
+        code_vocab,
+        device,
+    )
 
     items: List[str] = []
     for seq in beams:
@@ -147,7 +166,18 @@ def predict_topk_items(
             decoded.append(token)
         if not decoded:
             continue
-        item_id = tokens_to_item_id(decoded, semantic_to_item)
+        semantic_ids: List[str] = []
+        if len(decoded) >= 4:
+            for start in range(0, len(decoded) - 3):
+                semantic_ids.append(tokens_to_semantic_id(decoded[start : start + 4]))
+        if len(decoded) >= 3:
+            for start in range(0, len(decoded) - 2):
+                semantic_ids.append(tokens_to_semantic_id(decoded[start : start + 3]))
+        item_id = None
+        for sem_id in semantic_ids:
+            item_id = semantic_id_to_item_id(sem_id, semantic_to_item)
+            if item_id:
+                break
         if item_id and item_id not in items:
             items.append(item_id)
         if len(items) >= beam_size:
